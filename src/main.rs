@@ -14,6 +14,15 @@ use ratatui::{
     Terminal,
 };
 
+fn formato_dimensione(bytes: u64) -> String {
+    match bytes {
+        b if b < 1_024 => format!("{} B", b),
+        b if b < 1_048_576 => format!("{:.1} KB", b as f64 / 1_024.0),
+        b if b < 1_073_741_824 => format!("{:.1} MB", b as f64 / 1_048_576.0),
+        b => format!("{:.1} GB", b as f64 / 1_073_741_824.0),
+    }
+}
+
 #[derive(Clone)]
 struct ElementoFile {
     nome: String,
@@ -40,9 +49,12 @@ impl Pannello {
     }
 
     fn aggiorna_lista(&mut self) {
-        let vecchio_selezionato = self.indice_selezionato;
+        let nome_selezionato = self.elementi
+            .get(self.indice_selezionato)
+            .map(|e| e.nome.clone());
+
         self.elementi.clear();
-        
+
         // cartella superiore
         if let Some(genitore) = self.percorso_corrente.parent() {
             self.elementi.push(ElementoFile {
@@ -79,11 +91,11 @@ impl Pannello {
             }
         });
 
-        if vecchio_selezionato >= self.elementi.len() {
-            self.indice_selezionato = if !self.elementi.is_empty() { self.elementi.len() - 1 } else { 0 };
-        } else {
-            self.indice_selezionato = vecchio_selezionato;
-        }
+        self.indice_selezionato = nome_selezionato
+            .and_then(|nome| self.elementi.iter().position(|e| e.nome == nome))
+            .unwrap_or_else(|| {
+                if self.elementi.is_empty() { 0 } else { (self.indice_selezionato).min(self.elementi.len() - 1) }
+            });
     }
 
     fn muovi_su(&mut self) {
@@ -97,6 +109,11 @@ impl Pannello {
             self.indice_selezionato += 1;
         }
     }
+
+    fn elemento_selezionato(&self) -> Option<&ElementoFile> {
+        let elem = self.elementi.get(self.indice_selezionato)?;
+        if elem.nome.contains("..") { None } else { Some(elem) }
+    }
 }
 
 struct App {
@@ -104,6 +121,7 @@ struct App {
     pannello_destro: Pannello,
     sinistro_attivo: bool,
     messaggio_stato: String,
+    in_attesa_conferma_eliminazione: bool,
 }
 
 impl App {
@@ -130,33 +148,57 @@ impl App {
             let tipo_file = voce.file_type()?;
             let nome_file = voce.file_name();
             if tipo_file.is_dir() {
-                Self::copia_cartella_ricorsiva(&voce.path(), &destinazione.join(nome_file))?;
+                Self::copia_cartella_ricorsiva(&voce.path(), &destinazione.join(&nome_file))?;
             } else {
                 fs::copy(voce.path(), destinazione.join(nome_file))?;
             }
         }
         Ok(())
     }
+
+    fn crea_voci_lista(pannello: &Pannello, larghezza_pannello: usize) -> Vec<ListItem<'static>> {
+        pannello.elementi.iter().map(|item| {
+            let prefisso = if item.is_directory { "[DIR] " } else { "[FIL] " };
+            let testo_sinistro = format!("{}{}", prefisso, item.nome);
+
+            let testo_destro = if item.is_directory {
+                if item.nome.contains("..") { String::new() } else { String::from("<DIR>") }
+            } else {
+                formato_dimensione(item.dimensione) // FIX #9
+            };
+
+            let spazio_disponibile = larghezza_pannello.saturating_sub(testo_sinistro.chars().count());
+            let spazi = " ".repeat(spazio_disponibile.saturating_sub(testo_destro.chars().count()));
+            ListItem::new(format!("{}{}{}", testo_sinistro, spazi, testo_destro))
+        }).collect()
+    }
 }
 
 fn main() -> Result<(), io::Error> {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original_hook(info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // cartella del progetto ".")
+    // cartella del progetto "."
     let mut app = App {
         pannello_sinistro: Pannello::new(PathBuf::from(".")),
         pannello_destro: Pannello::new(PathBuf::from(".")),
         sinistro_attivo: true,
         messaggio_stato: String::from(" F5: Copia | F8: Elimina | Tab/Click Mouse: Cambia Pannello | Backspace: Indietro | q: Esci"),
+        in_attesa_conferma_eliminazione: false, // FIX #4
     };
 
     loop {
         terminal.draw(|f| {
-            // barra comandi (3 righe)
             let layout_verticale = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(3)])
@@ -174,24 +216,7 @@ fn main() -> Result<(), io::Error> {
 
             let larghezza_pannello = (layout_orizzontale[0].width as usize).saturating_sub(5);
 
-            let mut elementi_sinistri = Vec::new();
-            for item in &app.pannello_sinistro.elementi {
-                let prefisso = if item.is_directory { "[DIR] " } else { "[FIL] " };
-                let testo_sinistro = format!("{}{}", prefisso, item.nome);
-                
-                let testo_destro = if item.is_directory {
-                    if item.nome.contains("..") { String::new() } else { String::from("<DIR>") }
-                } else {
-                    format!("{:.1} KB", (item.dimensione as f64) / 1024.0)
-                };
-
-                let spazio_disponibile = larghezza_pannello.saturating_sub(testo_sinistro.chars().count());
-                let spazi = " ".repeat(spazio_disponibile.saturating_sub(testo_destro.chars().count()));
-                let riga_completa = format!("{}{}{}", testo_sinistro, spazi, testo_destro);
-                
-                elementi_sinistri.push(ListItem::new(riga_completa));
-            }
-            
+            let elementi_sinistri = App::crea_voci_lista(&app.pannello_sinistro, larghezza_pannello);
             let mut stato_sinistro = ListState::default();
             stato_sinistro.select(Some(app.pannello_sinistro.indice_selezionato));
             let colore_bordo_sinistro = if app.sinistro_attivo { Color::Green } else { Color::DarkGray };
@@ -202,24 +227,7 @@ fn main() -> Result<(), io::Error> {
                 .highlight_symbol(">> ");
             f.render_stateful_widget(lista_sinistra, layout_orizzontale[0], &mut stato_sinistro);
 
-            let mut elementi_destri = Vec::new();
-            for item in &app.pannello_destro.elementi {
-                let prefisso = if item.is_directory { "[DIR] " } else { "[FIL] " };
-                let testo_sinistro = format!("{}{}", prefisso, item.nome);
-                
-                let testo_destro = if item.is_directory {
-                    if item.nome.contains("..") { String::new() } else { String::from("<DIR>") }
-                } else {
-                    format!("{:.1} KB", (item.dimensione as f64) / 1024.0)
-                };
-
-                let spazio_disponibile = larghezza_pannello.saturating_sub(testo_sinistro.chars().count());
-                let spazi = " ".repeat(spazio_disponibile.saturating_sub(testo_destro.chars().count()));
-                let riga_completa = format!("{}{}{}", testo_sinistro, spazi, testo_destro);
-                
-                elementi_destri.push(ListItem::new(riga_completa));
-            }
-            
+            let elementi_destri = App::crea_voci_lista(&app.pannello_destro, larghezza_pannello);
             let mut stato_destro = ListState::default();
             stato_destro.select(Some(app.pannello_destro.indice_selezionato));
             let colore_bordo_destro = if !app.sinistro_attivo { Color::Green } else { Color::DarkGray };
@@ -243,7 +251,7 @@ fn main() -> Result<(), io::Error> {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
                             KeyCode::Char('q') => break,
-                            
+
                             KeyCode::Up => { app.pannello_attivo().muovi_su(); }
                             KeyCode::Down => { app.pannello_attivo().muovi_giu(); }
                             KeyCode::Tab => { app.sinistro_attivo = !app.sinistro_attivo; }
@@ -267,19 +275,15 @@ fn main() -> Result<(), io::Error> {
                                 }
                             }
 
-                            // Tasto F5
+                            // Tasto F5 - Copia
                             KeyCode::F(5) => {
-                                let (sorgente_path, nome_file, is_dir) = {
+                                let info_sorgente = {
                                     let src = app.pannello_attivo();
-                                    if src.elementi.is_empty() || (src.indice_selezionato == 0 && src.elementi[0].nome.contains("..")) {
-                                        (None, String::new(), false)
-                                    } else {
-                                        let elem = &src.elementi[src.indice_selezionato];
-                                        (Some(elem.percorso.clone()), elem.nome.clone(), elem.is_directory)
-                                    }
+                                    src.elemento_selezionato()
+                                        .map(|e| (e.percorso.clone(), e.nome.clone(), e.is_directory))
                                 };
 
-                                if let Some(src_path) = sorgente_path {
+                                if let Some((src_path, nome_file, is_dir)) = info_sorgente {
                                     let dest_dir = app.pannello_destinazione().percorso_corrente.clone();
                                     let dest_path = dest_dir.join(nome_file);
 
@@ -301,39 +305,54 @@ fn main() -> Result<(), io::Error> {
                                 }
                             }
 
-                            // Tasto F8
+                            // Tasto F8 - Elimina con conferma 
                             KeyCode::F(8) => {
-                                let sorgente_da_eliminare = {
+                                let info_elem = {
                                     let src = app.pannello_attivo();
-                                    if src.elementi.is_empty() || (src.indice_selezionato == 0 && src.elementi[0].nome.contains("..")) {
-                                        None
-                                    } else {
-                                        Some(src.elementi[src.indice_selezionato].clone())
-                                    }
+                                    src.elemento_selezionato().map(|e| e.clone())
                                 };
 
-                                if let Some(elem) = sorgente_da_eliminare {
-                                    let risultato = if elem.is_directory {
-                                        fs::remove_dir_all(&elem.percorso)
+                                if let Some(elem) = info_elem {
+                                    if app.in_attesa_conferma_eliminazione {
+                                        // Seconda pressione: procede con l'eliminazione
+                                        let risultato = if elem.is_directory {
+                                            fs::remove_dir_all(&elem.percorso)
+                                        } else {
+                                            fs::remove_file(&elem.percorso)
+                                        };
+
+                                        match risultato {
+                                            Ok(_) => app.messaggio_stato = format!("Eliminato: {}", elem.nome),
+                                            Err(e) => app.messaggio_stato = format!("Errore eliminazione: {}", e),
+                                        }
+
+                                        app.in_attesa_conferma_eliminazione = false;
+                                        app.pannello_sinistro.aggiorna_lista();
+                                        app.pannello_destro.aggiorna_lista();
                                     } else {
-                                        fs::remove_file(&elem.percorso)
-                                    };
-
-                                    match risultato {
-                                        Ok(_) => app.messaggio_stato = format!("Eliminato con successo: {}", elem.nome),
-                                        Err(e) => app.messaggio_stato = format!("Errore eliminazione: {}", e),
+                                        // Prima pressione: chiede conferma
+                                        app.messaggio_stato = format!(
+                                            "⚠ Conferma eliminazione di \"{}\"? Premi F8 di nuovo per confermare, altro tasto per annullare.",
+                                            elem.nome
+                                        );
+                                        app.in_attesa_conferma_eliminazione = true;
                                     }
-
-                                    app.pannello_sinistro.aggiorna_lista();
-                                    app.pannello_destro.aggiorna_lista();
                                 } else {
                                     app.messaggio_stato = String::from("Impossibile eliminare la cartella superiore.");
                                 }
                             }
-
-                            _ => {}
+                            _ => {
+                                if app.in_attesa_conferma_eliminazione {
+                                    app.in_attesa_conferma_eliminazione = false;
+                                    app.messaggio_stato = String::from("Eliminazione annullata.");
+                                }
+                            }
                         }
                     }
+                }
+
+                Event::Resize(_, _) => {
+					
                 }
 
                 // EVENTI MOUSE
@@ -345,13 +364,19 @@ fn main() -> Result<(), io::Error> {
 
                         if colonna_cliccata < meta_schermo {
                             app.sinistro_attivo = true;
-                            if riga_cliccata > 0 && riga_cliccata <= app.pannello_sinistro.elementi.len() {
-                                app.pannello_sinistro.indice_selezionato = riga_cliccata - 1;
+                            if riga_cliccata >= 2 {
+                                let idx = riga_cliccata - 2;
+                                if idx < app.pannello_sinistro.elementi.len() {
+                                    app.pannello_sinistro.indice_selezionato = idx;
+                                }
                             }
                         } else {
                             app.sinistro_attivo = false;
-                            if riga_cliccata > 0 && riga_cliccata <= app.pannello_destro.elementi.len() {
-                                app.pannello_destro.indice_selezionato = riga_cliccata - 1;
+                            if riga_cliccata >= 2 {
+                                let idx = riga_cliccata - 2;
+                                if idx < app.pannello_destro.elementi.len() {
+                                    app.pannello_destro.indice_selezionato = idx;
+                                }
                             }
                         }
                     }
